@@ -1,0 +1,29 @@
+[package]
+name = "kira-spatial-field"
+description = "Gene-field extraction and deterministic signal transforms for spatial transcriptomics."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/ARyaskov/kira-spatial-field"
+keywords = [
+    "bioinformatics",
+    "spatial",
+    "transcriptomics",
+    "gene",
+    "oncology"
+]
+categories = [
+    "science",
+    "science::bioinformatics",
+    "science::bioinformatics::genomics"
+]
+
+[features]
+simd = []
+field-cache = []
+
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+sha2 = "0.10"
+thiserror = "2"
