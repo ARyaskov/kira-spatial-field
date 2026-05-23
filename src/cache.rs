@@ -8,10 +8,7 @@ struct CacheState {
     order: VecDeque<[u8; 32]>,
 }
 
-/// Optional deterministic in-memory cache for fully constructed fields.
-///
-/// The cache key is `creation_hash` only. Cache usage does not alter field
-/// construction semantics; it only reuses already constructed immutable values.
+/// LRU in-memory cache keyed by `creation_hash`.
 pub struct FieldCache {
     inner: Mutex<CacheState>,
     capacity: usize,
@@ -29,8 +26,11 @@ impl FieldCache {
     }
 
     pub fn get(&self, key: &[u8; 32]) -> Option<Arc<Field>> {
-        let guard = self.inner.lock().ok()?;
-        guard.map.get(key).cloned()
+        let mut guard = self.inner.lock().ok()?;
+        let value = guard.map.get(key).cloned()?;
+        guard.order.retain(|existing| existing != key);
+        guard.order.push_back(*key);
+        Some(value)
     }
 
     pub fn insert(&self, field: Arc<Field>) {
@@ -45,15 +45,19 @@ impl FieldCache {
             return;
         };
 
-        if guard.map.contains_key(&key) {
-            guard.map.insert(key, field);
-            guard.order.retain(|existing| *existing != key);
-            guard.order.push_back(key);
-            return;
+        use std::collections::hash_map::Entry;
+        match guard.map.entry(key) {
+            Entry::Occupied(mut e) => {
+                e.insert(field);
+                guard.order.retain(|existing| *existing != key);
+                guard.order.push_back(key);
+                return;
+            }
+            Entry::Vacant(e) => {
+                e.insert(field);
+                guard.order.push_back(key);
+            }
         }
-
-        guard.map.insert(key, field);
-        guard.order.push_back(key);
 
         while guard.map.len() > self.capacity {
             if let Some(evict_key) = guard.order.pop_front() {
@@ -65,10 +69,7 @@ impl FieldCache {
     }
 }
 
-/// Computes a field and optionally interns it into a deterministic cache.
-///
-/// Behavior is deterministic with or without cache: identical inputs produce
-/// identical fields and hashes. Cache presence only affects reuse.
+/// Computes a field and optionally interns it into the cache.
 pub fn cached_or_compute<F>(
     cache: Option<&FieldCache>,
     compute: F,

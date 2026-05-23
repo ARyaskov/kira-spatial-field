@@ -1,10 +1,7 @@
 use crate::{normalization::NormalizationFlags, reduction::ReductionMethod};
 use serde::{Deserialize, Serialize};
 
-/// Metadata that describes how a [`crate::field::Field`] is defined.
-///
-/// Stage 0 note: this type carries declared provenance only.
-/// Validation, hashing, and semantic checks are implemented in later stages.
+/// Metadata describing how a [`crate::field::Field`] is defined.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldMetadata {
     field_name: String,
@@ -30,6 +27,21 @@ impl FieldMetadata {
             normalization_flags,
             creation_hash: None,
             axis_hash,
+        }
+    }
+
+    /// Start a builder.
+    pub fn builder(
+        field_name: impl Into<String>,
+        source_genes: Vec<String>,
+        reduction_method: ReductionMethod,
+    ) -> FieldMetadataBuilder {
+        FieldMetadataBuilder {
+            field_name: field_name.into(),
+            source_genes,
+            reduction_method,
+            normalization_flags: NormalizationFlags::default(),
+            axis_hash: None,
         }
     }
 
@@ -67,5 +79,33 @@ impl FieldMetadata {
 
     pub fn axis_hash(&self) -> Option<[u8; 32]> {
         self.axis_hash
+    }
+}
+
+pub struct FieldMetadataBuilder {
+    field_name: String,
+    source_genes: Vec<String>,
+    reduction_method: ReductionMethod,
+    normalization_flags: NormalizationFlags,
+    axis_hash: Option<[u8; 32]>,
+}
+
+impl FieldMetadataBuilder {
+    pub fn with_normalization_flags(mut self, flags: NormalizationFlags) -> Self {
+        self.normalization_flags = flags;
+        self
+    }
+    pub fn with_axis_hash(mut self, hash: [u8; 32]) -> Self {
+        self.axis_hash = Some(hash);
+        self
+    }
+    pub fn build(self) -> FieldMetadata {
+        FieldMetadata::new(
+            self.field_name,
+            self.source_genes,
+            self.reduction_method,
+            self.normalization_flags,
+            self.axis_hash,
+        )
     }
 }

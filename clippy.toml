@@ -1,0 +1,3 @@
+# `f32::total_cmp` is the right ordering for trimmed-mean sorting and
+# Welford accumulators. Stop clippy from second-guessing it.
+allow-comparison-to-zero = true

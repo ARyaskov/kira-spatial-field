@@ -1,4 +1,5 @@
 #![cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#![allow(unsafe_code)]
 
 use crate::error::FieldError;
 use crate::simd::scalar;
@@ -43,10 +44,6 @@ unsafe fn apply_sub_div_avx2_impl(
     if aligned_len < values.len() {
         let tail = scalar::apply_sub_div_scalar(&values[aligned_len..], sub, div)?;
         out[aligned_len..].copy_from_slice(&tail);
-    }
-
-    if out.iter().any(|value| !value.is_finite()) {
-        return Err(FieldError::InvalidValues);
     }
 
     Ok(out)

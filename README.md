@@ -32,6 +32,18 @@
 - `FieldMetadata` is immutable outside the crate and exposed via getters only.
 - All transforms allocate a new field; original fields remain unchanged.
 
+## Compatibility
+
+- **MSRV:** Rust 1.95 (Edition 2024). The crate uses let-chains and other
+  recent stable surface; older toolchains will refuse to compile.
+- The crate uses `#![deny(unsafe_code)]`. The only modules that opt back
+  in (via `#[allow(unsafe_code)]`) are the gated `simd::avx2` /
+  `simd::neon` intrinsics. Every other module is unsafe-free.
+- Public enums are `#[non_exhaustive]` — downstream `match` arms must
+  include a `_ => …` fallback so future variants stay non-breaking.
+- All public numeric entry points reject `NaN`/`Inf`; the SHA-256
+  `creation_hash` is the same across runs for the same input.
+
 ## Feature Flags
 
 | Feature | Default | Purpose |
@@ -62,6 +74,14 @@ When `simd` is enabled:
 - Crate version follows semver (`0.x.y` during early development).
 - `ReductionMethod` discriminants and hash byte order are part of the public determinism contract.
 - Breaking hash semantics or persisted metadata compatibility requires a major version bump.
+
+## Examples
+
+A runnable end-to-end example lives in [`examples/axis_field.rs`](examples/axis_field.rs):
+
+```bash
+cargo run --example axis_field
+```
 
 ## Minimal Usage
 

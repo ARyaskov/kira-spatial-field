@@ -1,8 +1,4 @@
 //! Immutable biological axis definition used for reproducible field workflows.
-//!
-//! `AxisDefinition` is immutable after validated construction.
-//! The stored SHA-256 hash guarantees reproducibility for the exact definition.
-//! Any semantic change to an axis requires a version bump.
 
 use crate::{error::FieldError, normalization::NormalizationFlags, reduction::ReductionMethod};
 use serde::{Deserialize, Serialize};
@@ -20,6 +16,8 @@ pub struct AxisDefinition {
 }
 
 impl AxisDefinition {
+    /// Build a validated [`AxisDefinition`]. `gene_ids` are sorted in-place
+    /// for canonical, hash-stable ordering.
     pub fn new(
         axis_id: String,
         version: u32,
@@ -89,8 +87,12 @@ impl AxisDefinition {
         hasher.update(axis_id.as_bytes());
         hasher.update(version.to_le_bytes());
 
-        let gene_bytes = gene_ids.join("\n");
-        hasher.update(gene_bytes.as_bytes());
+        for (i, gene_id) in gene_ids.iter().enumerate() {
+            if i > 0 {
+                hasher.update(b"\n");
+            }
+            hasher.update(gene_id.as_bytes());
+        }
 
         if let Some(weight_values) = weights {
             for weight in weight_values {
@@ -140,5 +142,108 @@ impl AxisDefinition {
 
     pub fn definition_hash(&self) -> &[u8; 32] {
         &self.definition_hash
+    }
+
+    /// Start a builder.
+    pub fn builder(
+        axis_id: impl Into<String>,
+        version: u32,
+        gene_ids: Vec<String>,
+        reduction_method: ReductionMethod,
+    ) -> AxisDefinitionBuilder {
+        AxisDefinitionBuilder {
+            axis_id: axis_id.into(),
+            version,
+            gene_ids,
+            weights: None,
+            reduction_method,
+            default_normalization: NormalizationFlags::default(),
+        }
+    }
+
+    /// Merge two axes into the alphabetical union of their gene sets.
+    /// For `Weighted`, overlapping weights are summed.
+    pub fn merge_union(
+        &self,
+        other: &AxisDefinition,
+        composite_id: impl Into<String>,
+        composite_version: u32,
+    ) -> Result<Self, FieldError> {
+        if std::mem::discriminant(&self.reduction_method)
+            != std::mem::discriminant(&other.reduction_method)
+        {
+            return Err(FieldError::InvalidReduction);
+        }
+
+        use std::collections::BTreeMap;
+        let mut acc: BTreeMap<String, f32> = BTreeMap::new();
+        let add = |acc: &mut BTreeMap<String, f32>, ids: &[String], ws: Option<&[f32]>| {
+            for (i, gid) in ids.iter().enumerate() {
+                let w = ws.map(|w| w[i]).unwrap_or(1.0);
+                let entry = acc.entry(gid.clone()).or_insert(0.0);
+                *entry += w;
+            }
+        };
+        add(&mut acc, &self.gene_ids, self.weights.as_deref());
+        add(&mut acc, &other.gene_ids, other.weights.as_deref());
+
+        let gene_ids: Vec<String> = acc.keys().cloned().collect();
+        let weights: Option<Vec<f32>> = match &self.reduction_method {
+            ReductionMethod::Weighted => Some(acc.values().copied().collect()),
+            _ => None,
+        };
+
+        AxisDefinition::new(
+            composite_id.into(),
+            composite_version,
+            gene_ids,
+            weights,
+            self.reduction_method.clone(),
+            self.default_normalization,
+        )
+    }
+
+    /// Jaccard similarity of two axes' gene sets.
+    pub fn jaccard(&self, other: &AxisDefinition) -> f64 {
+        use std::collections::HashSet;
+        let a: HashSet<&String> = self.gene_ids.iter().collect();
+        let b: HashSet<&String> = other.gene_ids.iter().collect();
+        let inter = a.intersection(&b).count();
+        let uni = a.union(&b).count();
+        if uni == 0 {
+            0.0
+        } else {
+            inter as f64 / uni as f64
+        }
+    }
+}
+
+pub struct AxisDefinitionBuilder {
+    axis_id: String,
+    version: u32,
+    gene_ids: Vec<String>,
+    weights: Option<Vec<f32>>,
+    reduction_method: ReductionMethod,
+    default_normalization: NormalizationFlags,
+}
+
+impl AxisDefinitionBuilder {
+    pub fn with_weights(mut self, weights: Vec<f32>) -> Self {
+        self.weights = Some(weights);
+        self
+    }
+    pub fn with_normalization(mut self, flags: NormalizationFlags) -> Self {
+        self.default_normalization = flags;
+        self
+    }
+    pub fn build(self) -> Result<AxisDefinition, FieldError> {
+        AxisDefinition::new(
+            self.axis_id,
+            self.version,
+            self.gene_ids,
+            self.weights,
+            self.reduction_method,
+            self.default_normalization,
+        )
     }
 }

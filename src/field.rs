@@ -7,9 +7,6 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 /// Computes a deterministic creation hash for provenance and reproducibility.
-///
-/// The hash is platform-independent because bytes are fed manually in a fixed
-/// order with explicit little-endian encoding for numeric values.
 fn compute_creation_hash(
     domain_id: u64,
     source_genes: &[String],
@@ -41,8 +38,16 @@ fn compute_creation_hash(
         hasher.update(axis_hash_bytes);
     }
 
-    for value in values {
-        hasher.update(value.to_le_bytes());
+    #[cfg(target_endian = "little")]
+    {
+        let byte_view: &[u8] = bytemuck::cast_slice(values);
+        hasher.update(byte_view);
+    }
+    #[cfg(target_endian = "big")]
+    {
+        for value in values {
+            hasher.update(value.to_le_bytes());
+        }
     }
 
     let digest = hasher.finalize();
@@ -63,18 +68,8 @@ fn validate_invariants(values: &[f32]) -> Result<(), FieldError> {
 
 /// Deterministic scalar field container for spatial operators.
 ///
-/// `Field` is logically immutable after construction.
-/// Value storage is Arc-backed to prevent accidental mutation while allowing
-/// efficient shared ownership in future cache-oriented integrations.
-/// Every transform returns a new `Field` with preserved determinism.
-///
-/// Stage 0 invariants are documented here and enforced in later stages:
-/// 1. The field contains exactly one scalar value per spatial bin.
-/// 2. Value ordering must exactly match the owning SpatialDomain ordering.
-/// 3. Values must not contain NaN or infinite numbers.
-/// 4. No implicit normalization is allowed at any API boundary.
-/// 5. `domain_id` binds the field identity to one concrete SpatialDomain.
-/// 6. Floating-point operations used to produce this field must be deterministic.
+/// Immutable after construction. Arc-backed values allow shared ownership.
+/// Every transform returns a new `Field`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Field {
     domain_id: u64,
@@ -97,9 +92,6 @@ impl Field {
     }
 
     pub(crate) fn finalize_creation_hash(mut self) -> Result<Self, FieldError> {
-        // `creation_hash` provides bitwise reproducibility: any change in
-        // construction inputs changes the digest, while identical inputs
-        // produce identical hashes suitable for provenance and cache keys.
         validate_invariants(self.values.as_ref())?;
 
         let hash = compute_creation_hash(
@@ -118,9 +110,45 @@ impl Field {
         Ok(self)
     }
 
+    /// Build a `Field` directly from pre-computed values, bypassing the
+    /// gene/panel/axis builders. `creation_hash` is computed during this call.
+    pub fn from_values(
+        domain_id: u64,
+        values: Vec<f32>,
+        metadata: FieldMetadata,
+    ) -> Result<Self, FieldError> {
+        Self::from_parts(domain_id, values, metadata).finalize_creation_hash()
+    }
+
+    /// Apply a deterministic element-wise transform left-to-right.
+    pub fn apply<F>(&self, field_name_suffix: &str, mut f: F) -> Result<Self, FieldError>
+    where
+        F: FnMut(f32) -> f32,
+    {
+        let mut out = Vec::with_capacity(self.values.len());
+        for &v in self.values.iter() {
+            let transformed = f(v);
+            if !transformed.is_finite() {
+                return Err(FieldError::InvalidValues);
+            }
+            out.push(transformed);
+        }
+        let mut metadata = self.metadata.clone();
+        metadata.append_field_name_suffix(field_name_suffix);
+        Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
+    }
+
     /// Returns immutable field values in domain bin order.
     pub fn values(&self) -> &[f32] {
         self.values.as_ref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
 
     /// Returns the bound spatial domain identity.
@@ -133,13 +161,7 @@ impl Field {
         &self.metadata
     }
 
-    /// Applies deterministic element-wise `ln(1 + x)` normalization.
-    ///
-    /// Determinism notes:
-    /// - Sequential left-to-right iteration over bins.
-    /// - Fixed floating-point operation order per element.
-    /// - No implicit scaling and no hidden state.
-    /// - Identical input yields identical output.
+    /// Deterministic element-wise `ln(1 + x)`.
     pub fn log1p(&self) -> Result<Self, FieldError> {
         let out = simd::apply_log1p(self.values.as_ref())?;
         if out.len() != self.values.len() {
@@ -155,13 +177,7 @@ impl Field {
         Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
     }
 
-    /// Applies deterministic global z-score normalization over all bins.
-    ///
-    /// Determinism notes:
-    /// - Sequential two-pass computation (mean, then variance).
-    /// - Fixed floating-point accumulation order.
-    /// - No implicit scaling and no hidden state.
-    /// - Identical input yields identical output.
+    /// Deterministic global z-score normalization over all bins.
     pub fn zscore_global(&self) -> Result<Self, FieldError> {
         let n = self.values.len();
         if n == 0 {
@@ -169,28 +185,28 @@ impl Field {
         }
         validate_invariants(self.values.as_ref())?;
 
-        let mut sum = 0.0_f32;
+        // Welford in f64 to avoid catastrophic cancellation at >10^6 elements.
+        let mut count: u64 = 0;
+        let mut mean64 = 0.0_f64;
+        let mut m2 = 0.0_f64;
         for &value in self.values.iter() {
-            sum += value;
+            let x = value as f64;
+            count += 1;
+            let delta = x - mean64;
+            mean64 += delta / count as f64;
+            let delta2 = x - mean64;
+            m2 += delta * delta2;
         }
-        let mean = sum / n as f32;
-        if !mean.is_finite() {
+        let variance64 = m2 / count as f64;
+        if !mean64.is_finite() || !variance64.is_finite() {
             return Err(FieldError::InvalidValues);
         }
-
-        let mut sq_sum = 0.0_f32;
-        for &value in self.values.iter() {
-            let diff = value - mean;
-            sq_sum += diff * diff;
-        }
-        let variance = sq_sum / n as f32;
-        if !variance.is_finite() {
+        let sigma64 = variance64.sqrt();
+        if !sigma64.is_finite() {
             return Err(FieldError::InvalidValues);
         }
-        let sigma = variance.sqrt();
-        if !sigma.is_finite() {
-            return Err(FieldError::InvalidValues);
-        }
+        let mean = mean64 as f32;
+        let sigma = sigma64 as f32;
 
         let mut out = Vec::with_capacity(n);
         if sigma == 0.0 {
@@ -211,51 +227,40 @@ impl Field {
         Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
     }
 
-    /// Applies deterministic masked z-score normalization.
-    ///
-    /// Determinism notes:
-    /// - Sequential two-pass computation over masked bins only.
-    /// - Fixed floating-point accumulation order.
-    /// - Unmasked bins are copied unchanged.
-    /// - No implicit scaling and no hidden state.
-    /// - Identical input yields identical output.
+    /// Deterministic z-score normalization over masked bins; unmasked bins
+    /// are copied unchanged.
     pub fn zscore_masked(&self, mask: &[bool]) -> Result<Self, FieldError> {
         if mask.len() != self.values.len() {
             return Err(FieldError::DomainSizeMismatch);
         }
         validate_invariants(self.values.as_ref())?;
 
-        let mut count = 0_usize;
-        let mut sum = 0.0_f32;
+        let mut count: u64 = 0;
+        let mut mean64 = 0.0_f64;
+        let mut m2 = 0.0_f64;
         for (idx, &is_masked) in mask.iter().enumerate() {
             if is_masked {
+                let x = self.values[idx] as f64;
                 count += 1;
-                sum += self.values[idx];
+                let delta = x - mean64;
+                mean64 += delta / count as f64;
+                let delta2 = x - mean64;
+                m2 += delta * delta2;
             }
         }
         if count == 0 {
             return Err(FieldError::InvalidValues);
         }
-        let mean = sum / count as f32;
-        if !mean.is_finite() {
+        let variance64 = m2 / count as f64;
+        if !mean64.is_finite() || !variance64.is_finite() {
             return Err(FieldError::InvalidValues);
         }
-
-        let mut sq_sum = 0.0_f32;
-        for (idx, &is_masked) in mask.iter().enumerate() {
-            if is_masked {
-                let diff = self.values[idx] - mean;
-                sq_sum += diff * diff;
-            }
-        }
-        let variance = sq_sum / count as f32;
-        if !variance.is_finite() {
+        let sigma64 = variance64.sqrt();
+        if !sigma64.is_finite() {
             return Err(FieldError::InvalidValues);
         }
-        let sigma = variance.sqrt();
-        if !sigma.is_finite() {
-            return Err(FieldError::InvalidValues);
-        }
+        let mean = mean64 as f32;
+        let sigma = sigma64 as f32;
 
         let mut out = Vec::with_capacity(self.values.len());
         for (idx, &value) in self.values.iter().enumerate() {
@@ -282,13 +287,7 @@ impl Field {
         Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
     }
 
-    /// Applies deterministic global min-max scaling.
-    ///
-    /// Determinism notes:
-    /// - Sequential min/max scan followed by sequential scaling.
-    /// - Fixed floating-point operation order.
-    /// - No implicit scaling and no hidden state.
-    /// - Identical input yields identical output.
+    /// Deterministic global min-max scaling.
     pub fn minmax_scale(&self) -> Result<Self, FieldError> {
         let n = self.values.len();
         if n == 0 {
@@ -328,5 +327,192 @@ impl Field {
         flags.minmax_scale = true;
         metadata.set_normalization_flags(flags);
         Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
+    }
+
+    /// `log1p` over masked bins; unmasked bins copied unchanged.
+    pub fn log1p_masked(&self, mask: &[bool]) -> Result<Self, FieldError> {
+        if mask.len() != self.values.len() {
+            return Err(FieldError::DomainSizeMismatch);
+        }
+        validate_invariants(self.values.as_ref())?;
+
+        let mut out = Vec::with_capacity(self.values.len());
+        for (idx, &value) in self.values.iter().enumerate() {
+            if mask[idx] {
+                if !value.is_finite() || value < -1.0 {
+                    return Err(FieldError::InvalidValues);
+                }
+                let t = (1.0_f32 + value).ln();
+                if !t.is_finite() {
+                    return Err(FieldError::InvalidValues);
+                }
+                out.push(t);
+            } else {
+                out.push(value);
+            }
+        }
+
+        let mut metadata = self.metadata.clone();
+        metadata.append_field_name_suffix("::log1p_masked");
+        let mut flags = *metadata.normalization_flags();
+        flags.log1p = true;
+        metadata.set_normalization_flags(flags);
+        Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
+    }
+
+    /// Min-max scaling over masked bins; unmasked bins copied unchanged.
+    pub fn minmax_scale_masked(&self, mask: &[bool]) -> Result<Self, FieldError> {
+        if mask.len() != self.values.len() {
+            return Err(FieldError::DomainSizeMismatch);
+        }
+        validate_invariants(self.values.as_ref())?;
+
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        let mut any = false;
+        for (idx, &value) in self.values.iter().enumerate() {
+            if mask[idx] {
+                any = true;
+                if value < min_v {
+                    min_v = value;
+                }
+                if value > max_v {
+                    max_v = value;
+                }
+            }
+        }
+        if !any {
+            return Err(FieldError::InvalidValues);
+        }
+
+        let mut out = Vec::with_capacity(self.values.len());
+        let denom = max_v - min_v;
+        for (idx, &value) in self.values.iter().enumerate() {
+            if mask[idx] {
+                if denom == 0.0 {
+                    out.push(0.0);
+                } else {
+                    let t = (value - min_v) / denom;
+                    if !t.is_finite() {
+                        return Err(FieldError::InvalidValues);
+                    }
+                    out.push(t);
+                }
+            } else {
+                out.push(value);
+            }
+        }
+
+        let mut metadata = self.metadata.clone();
+        metadata.append_field_name_suffix("::minmax_masked");
+        let mut flags = *metadata.normalization_flags();
+        flags.minmax_scale = true;
+        metadata.set_normalization_flags(flags);
+        Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
+    }
+
+    /// Element-wise addition.
+    pub fn add(&self, other: &Field) -> Result<Self, FieldError> {
+        self.binary_op(other, "::add", |a, b| a + b)
+    }
+
+    /// Element-wise subtraction.
+    pub fn sub(&self, other: &Field) -> Result<Self, FieldError> {
+        self.binary_op(other, "::sub", |a, b| a - b)
+    }
+
+    /// Element-wise multiplication.
+    pub fn mul(&self, other: &Field) -> Result<Self, FieldError> {
+        self.binary_op(other, "::mul", |a, b| a * b)
+    }
+
+    /// Element-wise division.
+    pub fn div(&self, other: &Field) -> Result<Self, FieldError> {
+        self.binary_op(other, "::div", |a, b| a / b)
+    }
+
+    /// Rank-normalize values into uniform `[0, 1]` order statistics.
+    /// Ties are broken deterministically by bin index.
+    pub fn rank_normalize(&self) -> Result<Self, FieldError> {
+        let n = self.values.len();
+        if n == 0 {
+            return Err(FieldError::InvalidValues);
+        }
+        validate_invariants(self.values.as_ref())?;
+
+        let mut indices: Vec<u32> = (0..n as u32).collect();
+        indices.sort_by(|&a, &b| {
+            self.values[a as usize]
+                .total_cmp(&self.values[b as usize])
+                .then(a.cmp(&b))
+        });
+
+        let mut out = vec![0.0_f32; n];
+        let denom = if n > 1 { (n - 1) as f32 } else { 1.0 };
+        for (rank, &idx) in indices.iter().enumerate() {
+            out[idx as usize] = rank as f32 / denom;
+        }
+
+        let mut metadata = self.metadata.clone();
+        metadata.append_field_name_suffix("::rank");
+        Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
+    }
+
+    fn binary_op<F>(&self, other: &Field, suffix: &str, mut op: F) -> Result<Self, FieldError>
+    where
+        F: FnMut(f32, f32) -> f32,
+    {
+        if self.domain_id != other.domain_id {
+            return Err(FieldError::DomainSizeMismatch);
+        }
+        if self.values.len() != other.values.len() {
+            return Err(FieldError::DomainSizeMismatch);
+        }
+        let mut out = Vec::with_capacity(self.values.len());
+        for (a, b) in self.values.iter().zip(other.values.iter()) {
+            let r = op(*a, *b);
+            if !r.is_finite() {
+                return Err(FieldError::InvalidValues);
+            }
+            out.push(r);
+        }
+        let mut metadata = self.metadata.clone();
+        metadata.append_field_name_suffix(suffix);
+        Self::from_parts(self.domain_id, out, metadata).finalize_creation_hash()
+    }
+}
+
+impl PartialEq for Field {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.metadata.creation_hash(), other.metadata.creation_hash()) {
+            (Some(a), Some(b)) => a == b,
+            _ => self.domain_id == other.domain_id && self.values.as_ref() == other.values.as_ref(),
+        }
+    }
+}
+
+impl Eq for Field {}
+
+impl std::fmt::Display for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hash_prefix = self
+            .metadata
+            .creation_hash()
+            .map(|h| {
+                let mut s = String::with_capacity(16);
+                for b in &h[..8] {
+                    s.push_str(&format!("{:02x}", b));
+                }
+                s
+            })
+            .unwrap_or_else(|| "<no-hash>".to_string());
+        write!(
+            f,
+            "Field {{ name={}, domain={}, len={}, hash={} }}",
+            self.metadata.field_name(),
+            self.domain_id,
+            self.values.len(),
+            hash_prefix,
+        )
     }
 }

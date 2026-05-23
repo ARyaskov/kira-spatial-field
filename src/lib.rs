@@ -1,10 +1,6 @@
-//! `kira-spatial-field` defines deterministic scalar field data structures for spatial domains.
-//!
-//! This crate provides structural contracts for field values and metadata only.
-//! It intentionally excludes spatial operators, sparse/CSR math, and transformation logic.
-//! Computation and domain primitives remain separated in `kira-spatial-core`.
-//! Optional SIMD acceleration is available as a performance layer only and
-//! never changes deterministic scalar semantics; scalar fallback is always present.
+#![deny(unsafe_code)]
+
+//! Deterministic scalar field data structures for spatial domains.
 
 pub mod axis;
 #[cfg(feature = "field-cache")]
@@ -17,6 +13,12 @@ pub mod normalization;
 pub mod reduction;
 mod simd;
 
+pub use axis::{AxisDefinition, AxisDefinitionBuilder};
 #[cfg(feature = "field-cache")]
 pub use cache::{FieldCache, cached_or_compute};
+pub use error::{FieldError, FieldErrorExt};
 pub use field::Field;
+pub use gene_field::axis_expressing_mask;
+pub use metadata::{FieldMetadata, FieldMetadataBuilder};
+pub use normalization::NormalizationFlags;
+pub use reduction::{PanelReduction, ReductionMethod};

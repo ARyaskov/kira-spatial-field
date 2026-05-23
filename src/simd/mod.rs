@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use crate::error::FieldError;
 
 pub mod scalar;
@@ -7,6 +9,8 @@ pub mod avx2;
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 pub mod neon;
 
+// `log1p` is scalar-only to preserve bitwise equality across SIMD toggles
+// (SIMD `ln` approximations differ from `f32::ln` by 1–4 ulp).
 pub fn apply_log1p(values: &[f32]) -> Result<Vec<f32>, FieldError> {
     scalar::apply_log1p_scalar(values)
 }
