@@ -21,4 +21,4 @@ pub use field::Field;
 pub use gene_field::axis_expressing_mask;
 pub use metadata::{FieldMetadata, FieldMetadataBuilder};
 pub use normalization::NormalizationFlags;
-pub use reduction::{PanelReduction, ReductionMethod};
+pub use reduction::{PanelReduction, ReductionMethod, module_score};
